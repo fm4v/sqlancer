@@ -80,62 +80,33 @@ public class ClickHouseExpressionGenerator
 
     public ClickHouseExpression generateExpressionWithColumns(List<ClickHouseColumnReference> columns,
             int remainingDepth) {
-        return generateNumericExpressionWithColumns(numericColumns(columns), remainingDepth);
-    }
-
-    // Every operator in the ColumnLike family (UNARY_PREFIX=MINUS, UNARY_FUNCTION, BINARY_ARITHMETIC,
-    // BINARY_FUNCTION) requires numeric operands. Feeding a String column to e.g. cos() trips
-    // ILLEGAL_TYPE_OF_ARGUMENT at parse time and bumps the unsuccessful-statement count without
-    // ever exercising the oracle. Filter to numeric columns up front and fall back to a numeric
-    // constant when the table has only non-numeric columns.
-    private ClickHouseExpression generateNumericExpressionWithColumns(List<ClickHouseColumnReference> columns,
-            int remainingDepth) {
         if (columns.isEmpty() || remainingDepth <= 2 && Randomly.getBooleanWithRatherLowProbability()) {
             if (allowNullLiterals && Randomly.getBooleanWithSmallProbability()) {
                 return ClickHouseCreateConstant.createNullConstant();
             }
-            return generateConstant(new ClickHouseLancerDataType(ClickHouseDataType.Int32));
+            return generateConstant(null);
         }
 
         if (remainingDepth <= 2 || Randomly.getBooleanWithRatherLowProbability()) {
-            return columns.get((int) Randomly.getNotCachedInteger(0, columns.size()));
+            return columns.get((int) Randomly.getNotCachedInteger(0, columns.size() - 1));
         }
 
         ColumnLike expr = Randomly.fromOptions(ColumnLike.values());
         switch (expr) {
         case UNARY_PREFIX:
-            return new ClickHouseUnaryPrefixOperation(generateNumericExpressionWithColumns(columns, remainingDepth - 1),
+            return new ClickHouseUnaryPrefixOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
                     ClickHouseUnaryPrefixOperator.MINUS);
         case BINARY_ARITHMETIC:
-            return new ClickHouseBinaryArithmeticOperation(
-                    generateNumericExpressionWithColumns(columns, remainingDepth - 1),
-                    generateNumericExpressionWithColumns(columns, remainingDepth - 1),
+            return new ClickHouseBinaryArithmeticOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    generateExpressionWithColumns(columns, remainingDepth - 1),
                     ClickHouseBinaryArithmeticOperation.ClickHouseBinaryArithmeticOperator.getRandom());
         case UNARY_FUNCTION:
-            return new ClickHouseUnaryFunctionOperation(
-                    generateNumericExpressionWithColumns(columns, remainingDepth - 1),
+            return new ClickHouseUnaryFunctionOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
                     ClickHouseUnaryFunctionOperation.ClickHouseUnaryFunctionOperator.getRandom());
         case BINARY_FUNCTION:
-            // intDiv/gcd/lcm require integer operands and ClickHouse promotes most math wrappers
-            // (sin, cos, sqrt, log, ...) to Float64, so a recursive descent over numeric columns
-            // routinely surfaces gcd(Float, Int) -- ILLEGAL_TYPE_OF_ARGUMENT. Take the integer-only
-            // branch with plain column-reference leaves to keep the expression integer-typed end to
-            // end; otherwise use the any-numeric sub-pool (max2/min2/pow) which tolerates Float.
-            List<ClickHouseColumnReference> integers = integerColumns(columns);
-            boolean useIntegerOnly = !integers.isEmpty() && Randomly.getBoolean();
-            if (useIntegerOnly) {
-                ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator intOp = Randomly.fromOptions(
-                        ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.INT_DIV,
-                        ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.GCD,
-                        ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.LCM);
-                return new ClickHouseBinaryFunctionOperation(
-                        integers.get((int) Randomly.getNotCachedInteger(0, integers.size())),
-                        integers.get((int) Randomly.getNotCachedInteger(0, integers.size())), intOp);
-            }
-            return new ClickHouseBinaryFunctionOperation(
-                    generateNumericExpressionWithColumns(columns, remainingDepth - 1),
-                    generateNumericExpressionWithColumns(columns, remainingDepth - 1),
-                    ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.getRandomAnyNumeric());
+            return new ClickHouseBinaryFunctionOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    generateExpressionWithColumns(columns, remainingDepth - 1),
+                    ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.getRandom());
         default:
             throw new AssertionError(expr);
         }
@@ -143,46 +114,36 @@ public class ClickHouseExpressionGenerator
 
     public ClickHouseExpression generateAggregateExpressionWithColumns(List<ClickHouseColumnReference> columns,
             int remainingDepth) {
-        List<ClickHouseColumnReference> numeric = numericColumns(columns);
         if (Randomly.getBooleanWithRatherLowProbability()) {
-            return new ClickHouseAggregate(generateNumericExpressionWithColumns(numeric, remainingDepth - 1),
+            return new ClickHouseAggregate(generateExpressionWithColumns(columns, remainingDepth - 1),
                     ClickHouseAggregate.ClickHouseAggregateFunction.getRandom());
         }
-        return generateNumericExpressionWithColumns(numeric, remainingDepth);
-    }
+        if (columns.isEmpty() || remainingDepth <= 2 && Randomly.getBooleanWithRatherLowProbability()) {
+            return generateConstant(null);
+        }
 
-    // Returns the subset of `cols` whose root type is numeric (Int*/UInt*/Float*). The check uses
-    // ClickHouseLancerDataType.getType(), which already unwraps Nullable and LowCardinality.
-    private static List<ClickHouseColumnReference> numericColumns(List<ClickHouseColumnReference> cols) {
-        return cols.stream().filter(c -> isNumeric(c.getColumn().getType().getType())).collect(Collectors.toList());
-    }
+        if (remainingDepth <= 2 || Randomly.getBooleanWithRatherLowProbability()) {
+            return columns.get((int) Randomly.getNotCachedInteger(0, columns.size() - 1));
+        }
 
-    // Subset restricted to integer types -- needed for intDiv/gcd/lcm which reject Float.
-    private static List<ClickHouseColumnReference> integerColumns(List<ClickHouseColumnReference> cols) {
-        return cols.stream().filter(c -> isInteger(c.getColumn().getType().getType())).collect(Collectors.toList());
-    }
-
-    private static boolean isNumeric(ClickHouseDataType type) {
-        return isInteger(type) || type == ClickHouseDataType.Float32 || type == ClickHouseDataType.Float64;
-    }
-
-    private static boolean isInteger(ClickHouseDataType type) {
-        switch (type) {
-        case Int8:
-        case Int16:
-        case Int32:
-        case Int64:
-        case Int128:
-        case Int256:
-        case UInt8:
-        case UInt16:
-        case UInt32:
-        case UInt64:
-        case UInt128:
-        case UInt256:
-            return true;
+        ColumnLike expr = Randomly.fromOptions(ColumnLike.values());
+        switch (expr) {
+        case UNARY_PREFIX:
+            return new ClickHouseUnaryPrefixOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    ClickHouseUnaryPrefixOperator.MINUS);
+        case BINARY_ARITHMETIC:
+            return new ClickHouseBinaryArithmeticOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    generateExpressionWithColumns(columns, remainingDepth - 1),
+                    ClickHouseBinaryArithmeticOperation.ClickHouseBinaryArithmeticOperator.getRandom());
+        case UNARY_FUNCTION:
+            return new ClickHouseUnaryFunctionOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    ClickHouseUnaryFunctionOperation.ClickHouseUnaryFunctionOperator.getRandom());
+        case BINARY_FUNCTION:
+            return new ClickHouseBinaryFunctionOperation(generateExpressionWithColumns(columns, remainingDepth - 1),
+                    generateExpressionWithColumns(columns, remainingDepth - 1),
+                    ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.getRandom());
         default:
-            return false;
+            throw new AssertionError(expr);
         }
     }
 
@@ -190,7 +151,7 @@ public class ClickHouseExpressionGenerator
             int remainingDepth) {
         if (remainingDepth <= 2 || Randomly.getBooleanWithRatherLowProbability()) {
             if (Randomly.getBoolean()) {
-                return expression.get((int) Randomly.getNotCachedInteger(0, expression.size()));
+                return expression.get((int) Randomly.getNotCachedInteger(0, expression.size() - 1));
             } else {
                 return generateConstant(null);
             }
@@ -224,12 +185,10 @@ public class ClickHouseExpressionGenerator
                     generateExpressionWithExpression(expression, remainingDepth - 1),
                     ClickHouseUnaryFunctionOperation.ClickHouseUnaryFunctionOperator.getRandom());
         case BINARY_FUNCTION:
-            // Leaves here are pre-built expressions of unknown root type (typically aggregate
-            // results, often Float). Restrict to any-numeric ops -- gcd/lcm/intDiv would reject Float.
             return new ClickHouseBinaryFunctionOperation(
                     generateExpressionWithExpression(expression, remainingDepth - 1),
                     generateExpressionWithExpression(expression, remainingDepth - 1),
-                    ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.getRandomAnyNumeric());
+                    ClickHouseBinaryFunctionOperation.ClickHouseBinaryFunctionOperator.getRandom());
         default:
             throw new AssertionError(type);
         }
@@ -248,13 +207,10 @@ public class ClickHouseExpressionGenerator
         }
         Expression expr = Randomly.fromOptions(Expression.values());
         ClickHouseLancerDataType leftLeafType = ClickHouseLancerDataType.getRandom();
-        // Binary operators want same-typed leaves: Int32-vs-String comparisons trip TYPE_MISMATCH
-        // (Code 53) and arithmetic on String trips ILLEGAL_TYPE_OF_ARGUMENT (Code 43). The previous
-        // code drew rightLeafType independently and only forced equality with low probability --
-        // inverted from the right default. Keep a small chance of mixed types so cross-width Int
-        // comparisons are still exercised when the type pool grows beyond {Int32, String}.
-        ClickHouseLancerDataType rightLeafType = Randomly.getBooleanWithRatherLowProbability()
-                ? ClickHouseLancerDataType.getRandom() : leftLeafType;
+        ClickHouseLancerDataType rightLeafType = ClickHouseLancerDataType.getRandom();
+        if (Randomly.getBooleanWithRatherLowProbability()) {
+            rightLeafType = leftLeafType;
+        }
 
         switch (expr) {
         case UNARY_PREFIX:
@@ -291,32 +247,9 @@ public class ClickHouseExpressionGenerator
             ClickHouseTableReference rightTable) {
         List<ClickHouseColumnReference> leftColumns = leftTable.getColumnReferences();
         List<ClickHouseColumnReference> rightColumns = rightTable.getColumnReferences();
-        // Build a viable (leftKey, rightKey) pair. ClickHouse needs same-typed (or
-        // implicitly-coercible) join keys -- mixed String/Int trips Code 386 NO_COMMON_TYPE and
-        // complex non-column expressions trip Code 403 INVALID_JOIN_ON_EXPRESSION. First try a
-        // same-type pair, then an Int<->Float coercion pair, only then fall back to any pair.
-        List<ClickHouseColumnReference[]> sameType = new ArrayList<>();
-        List<ClickHouseColumnReference[]> numericPairs = new ArrayList<>();
-        for (ClickHouseColumnReference l : leftColumns) {
-            ClickHouseDataType lt = l.getColumn().getType().getType();
-            for (ClickHouseColumnReference r : rightColumns) {
-                ClickHouseDataType rt = r.getColumn().getType().getType();
-                if (lt == rt) {
-                    sameType.add(new ClickHouseColumnReference[] { l, r });
-                } else if (isNumeric(lt) && isNumeric(rt)) {
-                    numericPairs.add(new ClickHouseColumnReference[] { l, r });
-                }
-            }
-        }
-        List<ClickHouseColumnReference[]> pool = !sameType.isEmpty() ? sameType
-                : !numericPairs.isEmpty() ? numericPairs : null;
-        if (pool == null) {
-            // The two tables share no compatible key combination. Any pair we emit would trip
-            // Code 386 NO_COMMON_TYPE; skip the iteration rather than burn a server roundtrip.
-            throw new IgnoreMeException();
-        }
-        ClickHouseColumnReference[] pair = Randomly.fromList(pool);
-        return new ClickHouseExpression.ClickHouseJoinOnClause(pair[0], pair[1]);
+        ClickHouseExpression leftExpr = generateExpressionWithColumns(leftColumns, 2);
+        ClickHouseExpression rightExpr = generateExpressionWithColumns(rightColumns, 2);
+        return new ClickHouseExpression.ClickHouseJoinOnClause(leftExpr, rightExpr);
     }
 
     @Override
@@ -362,7 +295,7 @@ public class ClickHouseExpressionGenerator
             int nrJoinClauses = (int) Randomly.getNotCachedInteger(0, tables.size());
             for (int i = 0; i < nrJoinClauses; i++) {
                 ClickHouseTableReference leftTable = leftTables
-                        .get((int) Randomly.getNotCachedInteger(0, leftTables.size()));
+                        .get((int) Randomly.getNotCachedInteger(0, leftTables.size() - 1));
                 ClickHouseTableReference rightTable = new ClickHouseTableReference(Randomly.fromList(tables),
                         "right_" + i);
                 ClickHouseExpression.ClickHouseJoinOnClause joinClause = generateJoinClause(leftTable, rightTable);
@@ -515,7 +448,7 @@ public class ClickHouseExpressionGenerator
             int nrJoinClauses = (int) Randomly.getNotCachedInteger(0, tables.size());
             for (int i = 0; i < nrJoinClauses; i++) {
                 ClickHouseTableReference leftTable = leftTables
-                        .get((int) Randomly.getNotCachedInteger(0, leftTables.size()));
+                        .get((int) Randomly.getNotCachedInteger(0, leftTables.size() - 1));
                 ClickHouseTableReference rightTable = new ClickHouseTableReference(Randomly.fromList(tables),
                         "right_" + i);
                 ClickHouseExpression.ClickHouseJoinOnClause joinClause = generateJoinClause(leftTable, rightTable);
